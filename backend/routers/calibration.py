@@ -19,7 +19,15 @@ from core.loss_model import CoilParams as CoreCoilParams
 from core.loss_model import SimpleIronLoss as CoreSimpleIronLoss
 from core.loss_model import make_simple_loss_fn
 from core.motor_geometry import compute_thermal_masses
-from schemas.calibration import CalibRequest, CalibResult, ThermalParams
+from core.thermal_model import simulate_3node_final
+from schemas.calibration import (
+    CalibRequest,
+    CalibResult,
+    ColumnMapping,
+    FileCalibResult,
+    FileConditions,
+    ThermalParams,
+)
 from storage.profiles import get_profile, update_calib_result
 
 router = APIRouter()
@@ -41,10 +49,19 @@ def _get_file_path(file_id: str) -> Path:
 
 
 def _parse_data_file(filepath: Path) -> pd.DataFrame:
-    """Parse a CSV or Excel file."""
+    """Parse a CSV or Excel file.
+
+    Tries encodings in order: utf-8, cp949, latin-1.
+    CP949 covers Korean (EUC-KR) exports from power analyzers.
+    """
     suffix = filepath.suffix.lower()
     if suffix == ".csv":
-        return pd.read_csv(filepath)
+        for enc in ("utf-8", "cp949", "latin-1"):
+            try:
+                return pd.read_csv(filepath, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Could not decode CSV file: {filepath.name}")
     elif suffix in (".xlsx", ".xls"):
         return pd.read_excel(filepath)
     else:
@@ -54,10 +71,11 @@ def _parse_data_file(filepath: Path) -> pd.DataFrame:
 def _run_calibration_job(
     job_id: str,
     profile_id: str,
-    data_file_id: str,
+    data_file_ids: list[str],
     settings: "CalibSettings",
     loop: asyncio.AbstractEventLoop,
     queue: asyncio.Queue,
+    column_mapping: "ColumnMapping | None" = None,
 ) -> None:
     """Run calibration in a background thread and push events to the queue."""
     try:
@@ -69,12 +87,23 @@ def _run_calibration_job(
             )
             return
 
-        # Load data file
-        data_path = _get_file_path(data_file_id)
-        df = _parse_data_file(data_path)
+        # Load and merge data from all files, tracking file boundaries
+        file_frames: list[tuple[pd.DataFrame, str, str]] = []  # (df, file_id, filename)
+        for fid in data_file_ids:
+            data_path = _get_file_path(fid)
+            file_frames.append((_parse_data_file(data_path), fid, data_path.name))
+        df = pd.concat([ff[0] for ff in file_frames], ignore_index=True) if len(file_frames) > 1 else file_frames[0][0]
+
+        # Build boundary indices: (start_idx, end_idx) per file in the concatenated df
+        file_boundaries: list[tuple[int, int, str, str]] = []  # (start, end, file_id, filename)
+        offset = 0
+        for fdf, fid, fname in file_frames:
+            n = len(fdf)
+            file_boundaries.append((offset, offset + n, fid, fname))
+            offset += n
 
         # Extract arrays from dataframe
-        # Use default column names or detect numeric columns
+        # Use explicit column mapping if provided, otherwise auto-detect
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
         time_col = None
@@ -83,19 +112,26 @@ def _run_calibration_job(
         T_amb_col = None
         T_coil_col = None
 
-        # Auto-detect columns by name heuristics
-        for col in numeric_cols:
-            col_lower = col.lower().strip()
-            if "time" in col_lower and time_col is None:
-                time_col = col
-            elif "rpm" in col_lower and rpm_col is None:
-                rpm_col = col
-            elif col_lower in ("i_phase", "i", "current", "i_a") and I_col is None:
-                I_col = col
-            elif "t_amb" in col_lower or "ambient" in col_lower:
-                T_amb_col = col
-            elif "t_coil" in col_lower or "coil" in col_lower:
-                T_coil_col = col
+        if column_mapping is not None:
+            I_col = column_mapping.I_phase
+            T_amb_col = column_mapping.T_amb
+            T_coil_col = column_mapping.T_coil
+            time_col = column_mapping.time
+            rpm_col = column_mapping.rpm
+        else:
+            # Auto-detect columns by name heuristics
+            for col in numeric_cols:
+                col_lower = col.lower().strip()
+                if "time" in col_lower and time_col is None:
+                    time_col = col
+                elif "rpm" in col_lower and rpm_col is None:
+                    rpm_col = col
+                elif col_lower in ("i_phase", "i", "current", "i_a") and I_col is None:
+                    I_col = col
+                elif "t_amb" in col_lower or "ambient" in col_lower:
+                    T_amb_col = col
+                elif "t_coil" in col_lower or "coil" in col_lower:
+                    T_coil_col = col
 
         # Fallback: use positional if not enough detected
         if I_col is None and len(numeric_cols) >= 2:
@@ -213,6 +249,48 @@ def _run_calibration_job(
             progress_callback=progress_cb,
         )
 
+        # Build per-file results by re-simulating each file independently
+        per_file_results: list[FileCalibResult] = []
+        if len(file_boundaries) > 1 or (len(file_boundaries) == 1 and file_boundaries[0][2]):
+            for start_idx, end_idx, fid, fname in file_boundaries:
+                file_time = time_array[start_idx:end_idx]
+                file_I = I_array[start_idx:end_idx]
+                file_rpm = rpm_array[start_idx:end_idx]
+                file_T_amb = T_amb_array[start_idx:end_idx]
+                file_T_coil_meas = T_coil_meas[start_idx:end_idx]
+
+                # Re-simulate with optimized parameters (starts from file's own ambient)
+                file_sim = simulate_3node_final(
+                    time_array=file_time,
+                    I_array=file_I,
+                    rpm_array=file_rpm,
+                    T_amb_array=file_T_amb,
+                    C_coil=masses.C_coil,
+                    C_core=masses.C_core,
+                    C_housing=masses.C_housing,
+                    R1=result.R1,
+                    R2=result.R2,
+                    h_nat=result.h_nat,
+                    h_rpm=result.h_rpm,
+                    A_housing=masses.A_housing,
+                    loss_fn=loss_fn,
+                )
+
+                per_file_results.append(FileCalibResult(
+                    file_id=fid,
+                    filename=fname,
+                    conditions=FileConditions(
+                        I_mean=float(np.mean(file_I)),
+                        T_amb_mean=float(np.mean(file_T_amb)),
+                        rpm_representative=float(np.mean(file_rpm)) if len(file_rpm) > 0 else 0.0,
+                    ),
+                    time_array=file_time.tolist(),
+                    T_coil_meas=file_T_coil_meas.tolist(),
+                    T_coil_sim=file_sim.T_coil.tolist(),
+                    T_core_sim=file_sim.T_core.tolist(),
+                    T_housing_sim=file_sim.T_housing.tolist(),
+                ))
+
         # Build API result
         calib_result = CalibResult(
             params=ThermalParams(
@@ -229,10 +307,13 @@ def _run_calibration_job(
             T_coil_sim=result.T_coil_sim.tolist(),
             T_core_sim=result.T_core_sim.tolist(),
             T_housing_sim=result.T_housing_sim.tolist(),
+            T_coil_meas=T_coil_meas.tolist(),
+            time_array=time_array.tolist(),
             residuals=result.residuals.tolist(),
             time_s=result.time_s,
             converged=result.converged,
             loss_history=result.loss_history,
+            per_file_results=per_file_results,
         )
 
         # Save result to job store and profile
@@ -252,15 +333,23 @@ def _run_calibration_job(
 
     except Exception as exc:
         _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(exc)
+        error_msg = str(exc)
+        _jobs[job_id]["error"] = error_msg
         loop.call_soon_threadsafe(
-            lambda: queue.put_nowait({"type": "error", "message": str(exc)})
+            lambda: queue.put_nowait({"type": "error", "message": error_msg})
         )
 
 
 @router.post("/start")
 async def start_calibration(body: CalibRequest) -> dict:
     """Start a calibration run and return job_id."""
+    try:
+        file_ids = body.resolved_file_ids()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail=str(exc)
+        ) from exc
+
     job_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
     _jobs[job_id] = {"status": "running", "result": None, "error": None, "queue": queue}
@@ -271,10 +360,11 @@ async def start_calibration(body: CalibRequest) -> dict:
         _run_calibration_job,
         job_id,
         body.profile_id,
-        body.data_file_id,
+        file_ids,
         body.settings,
         loop,
         queue,
+        body.column_mapping,
     )
 
     return {"job_id": job_id}

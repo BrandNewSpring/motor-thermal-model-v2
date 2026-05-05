@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
@@ -13,6 +14,7 @@ from schemas.data import (
     ColumnMappingRequest,
     ColumnMappingResponse,
     FileColumnsResponse,
+    FileConditionSummary,
     FileUploadResponse,
 )
 
@@ -34,10 +36,20 @@ def _detect_numeric_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _parse_file(filepath: Path) -> pd.DataFrame:
-    """Parse CSV or Excel file into a DataFrame."""
+    """Parse CSV or Excel file into a DataFrame.
+
+    Tries encodings in order: utf-8, cp949, latin-1.
+    CP949 covers Korean (EUC-KR) exports from power analyzers.
+    latin-1 is the last resort (accepts any byte but may garble non-Latin text).
+    """
     suffix = filepath.suffix.lower()
     if suffix == ".csv":
-        return pd.read_csv(filepath)
+        for enc in ("utf-8", "cp949", "latin-1"):
+            try:
+                return pd.read_csv(filepath, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Could not decode CSV file: {filepath.name}")
     elif suffix in (".xlsx", ".xls"):
         return pd.read_excel(filepath)
     else:
@@ -182,6 +194,150 @@ async def map_columns(file_id: str, mapping: ColumnMappingRequest) -> ColumnMapp
         mapped_rows=int(valid_mask.sum()),
         summary=summary,
     )
+
+
+# @MX:NOTE: [AUTO] Batch upload endpoint allows frontend to upload multiple test data files at once
+@router.post("/upload-batch", response_model=List[FileUploadResponse])
+async def upload_batch(
+    files: List[UploadFile] = File(...),
+    type: str = Form("test_data"),
+) -> List[FileUploadResponse]:
+    """Upload multiple CSV or Excel files and return parsed metadata for each."""
+    _ensure_uploads_dir()
+
+    if type not in ("test_data", "loss_map"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid type '{type}'. Must be 'test_data' or 'loss_map'",
+        )
+
+    results: list[FileUploadResponse] = []
+    for file in files:
+        filename = file.filename or "unknown"
+        suffix = Path(filename).suffix.lower()
+        if suffix not in (".csv", ".xlsx", ".xls"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {suffix}. Supported: .csv, .xlsx, .xls",
+            )
+
+        file_id = str(uuid.uuid4())
+        dest_path = UPLOADS_DIR / f"{file_id}_{filename}"
+
+        content = await file.read()
+        dest_path.write_bytes(content)
+
+        try:
+            df = _parse_file(dest_path)
+        except Exception as exc:
+            dest_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400, detail=f"Failed to parse file '{filename}': {exc}"
+            ) from exc
+
+        numeric_cols = _detect_numeric_columns(df)
+        preview = df.head(5).to_dict(orient="records")
+
+        _file_store[file_id] = {
+            "file_id": file_id,
+            "filename": filename,
+            "filepath": str(dest_path),
+            "rows": len(df),
+            "columns": list(df.columns),
+            "numeric_columns": numeric_cols,
+            "type": type,
+        }
+
+        results.append(
+            FileUploadResponse(
+                file_id=file_id,
+                filename=filename,
+                rows=len(df),
+                columns=list(df.columns),
+                preview=preview,
+            )
+        )
+
+    return results
+
+
+def _extract_conditions(
+    df: pd.DataFrame,
+    file_id: str,
+    filename: str,
+    mapping: ColumnMappingRequest,
+) -> FileConditionSummary:
+    """Extract test condition ranges from a DataFrame using the given column mapping."""
+    I_col = pd.to_numeric(df[mapping.I_phase], errors="coerce")
+    T_amb_col = pd.to_numeric(df[mapping.T_amb], errors="coerce")
+    T_coil_col = pd.to_numeric(df[mapping.T_coil], errors="coerce")
+
+    rpm_range: tuple[float | None, float | None] = (None, None)
+    if mapping.rpm and mapping.rpm in df.columns:
+        rpm_col = pd.to_numeric(df[mapping.rpm], errors="coerce")
+        rpm_range = (
+            float(rpm_col.min()) if not rpm_col.isna().all() else None,
+            float(rpm_col.max()) if not rpm_col.isna().all() else None,
+        )
+
+    duration_s: float | None = None
+    if mapping.time and mapping.time in df.columns:
+        time_col = pd.to_numeric(df[mapping.time], errors="coerce")
+        if not time_col.isna().all():
+            duration_s = float(time_col.max() - time_col.min())
+
+    return FileConditionSummary(
+        file_id=file_id,
+        filename=filename,
+        rows=len(df),
+        I_range=(
+            float(I_col.min()) if not I_col.isna().all() else None,
+            float(I_col.max()) if not I_col.isna().all() else None,
+        ),
+        rpm_range=rpm_range,
+        T_amb_mean=float(T_amb_col.mean()) if not T_amb_col.isna().all() else None,
+        T_coil_range=(
+            float(T_coil_col.min()) if not T_coil_col.isna().all() else None,
+            float(T_coil_col.max()) if not T_coil_col.isna().all() else None,
+        ),
+        duration_s=duration_s,
+    )
+
+
+# @MX:NOTE: [AUTO] Condition extraction endpoint returns test condition ranges for a single file
+@router.post("/{file_id}/conditions", response_model=FileConditionSummary)
+async def extract_conditions(
+    file_id: str, mapping: ColumnMappingRequest
+) -> FileConditionSummary:
+    """Extract test condition ranges from a single file given a column mapping."""
+    meta = _file_store.get(file_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+
+    filepath = Path(meta["filepath"])
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="File data not found on disk")
+
+    try:
+        df = _parse_file(filepath)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to parse file: {exc}"
+        ) from exc
+
+    # Validate required columns exist
+    for field_name, col_name in [
+        ("I_phase", mapping.I_phase),
+        ("T_amb", mapping.T_amb),
+        ("T_coil", mapping.T_coil),
+    ]:
+        if col_name not in df.columns:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Column '{col_name}' for field '{field_name}' not found in file",
+            )
+
+    return _extract_conditions(df, file_id, meta["filename"], mapping)
 
 
 @router.delete("/{file_id}")

@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import calibration, export, files, prediction, profiles
+from routers import calibration, compressor, export, files, prediction, profiles
 
 app = FastAPI(
     title="Motor Thermal Model v2",
@@ -26,6 +26,7 @@ app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
 app.include_router(calibration.router, prefix="/api/calibration", tags=["calibration"])
 app.include_router(prediction.router, prefix="/api/prediction", tags=["prediction"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
+app.include_router(compressor.router, prefix="/api/compressor", tags=["compressor"])
 
 
 @app.get("/api/health")

@@ -6,6 +6,7 @@ import {
   Settings2,
   ChevronLeft,
   ChevronRight,
+  Thermometer,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useEffect } from "react";
@@ -13,6 +14,7 @@ import { useEffect } from "react";
 const NAV_ITEMS = [
   { to: "/", label: "Calibration", icon: FlaskConical, page: "calibration" as const },
   { to: "/prediction", label: "Prediction", icon: TrendingUp, page: "prediction" as const },
+  { to: "/compressor", label: "Compressor", icon: Thermometer, page: "compressor" as const },
   { to: "/profiles", label: "Profiles", icon: Settings2, page: "profiles" as const },
 ];
 

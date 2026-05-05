@@ -13,6 +13,22 @@ interface CalibSettingsProps {
   fileId: string | null;
 }
 
+const COL_LABELS: Record<string, string> = {
+  time: "Time",
+  rpm: "RPM",
+  I_phase: "I phase",
+  T_amb: "T ambient",
+  T_coil: "T coil",
+  torque: "Torque",
+};
+const COL_HINTS: Record<string, string> = {
+  time: "Elapsed seconds",
+  rpm: "Motor speed [/min]",
+  I_phase: "Phase current [A]",
+  T_amb: "Ambient/chamber temp",
+  T_coil: "Coil/winding temp",
+  torque: "Torque [Nm]",
+};
 const REQUIRED_COLS = ["I_phase", "T_amb", "T_coil"];
 const OPTIONAL_COLS = ["time", "rpm", "torque"];
 const ALL_COLS = [...REQUIRED_COLS, ...OPTIONAL_COLS];
@@ -51,6 +67,10 @@ export default function CalibSettingsForm({
     key: K,
     value: CalibSettingsType[K],
   ) {
+    // Guard: reject NaN for numeric fields to prevent 422 from backend gt=0 constraints
+    if (typeof value === "number" && Number.isNaN(value)) {
+      return;
+    }
     onSettingsChange({ ...settings, [key]: value });
   }
 
@@ -65,8 +85,8 @@ export default function CalibSettingsForm({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {ALL_COLS.map((field) => (
               <div key={field} className="flex items-center gap-2">
-                <label className="w-20 text-xs text-muted-foreground shrink-0">
-                  {field}
+                <label className="w-20 text-xs text-muted-foreground shrink-0" title={COL_HINTS[field]}>
+                  {COL_LABELS[field] ?? field}
                   {REQUIRED_COLS.includes(field) && (
                     <span className="text-destructive">*</span>
                   )}
@@ -186,12 +206,13 @@ export default function CalibSettingsForm({
                   placeholder="auto"
                   className="w-24 rounded-md border border-input bg-background px-2 py-1 text-xs font-mono tabular-nums"
                   value={settings.R1_init ?? ""}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
                     updateSetting(
                       "R1_init",
-                      e.target.value ? parseFloat(e.target.value) : null,
-                    )
-                  }
+                      e.target.value && v > 0 ? v : null,
+                    );
+                  }}
                 />
               </div>
               <div className="flex items-center gap-2">
@@ -204,11 +225,13 @@ export default function CalibSettingsForm({
                   placeholder="auto"
                   className="w-24 rounded-md border border-input bg-background px-2 py-1 text-xs font-mono tabular-nums"
                   value={settings.R2_init ?? ""}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
                     updateSetting(
                       "R2_init",
-                      e.target.value ? parseFloat(e.target.value) : null,
-                    )
+                      e.target.value && v > 0 ? v : null,
+                    );
+                  }
                   }
                 />
               </div>

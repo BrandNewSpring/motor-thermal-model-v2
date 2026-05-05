@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -103,6 +103,28 @@ class GridPredictionResult(BaseModel):
     grid_T_coil: List[List[float]] = Field(..., description="T_coil_ss on grid")
     grid_T_core: List[List[float]] = Field(..., description="T_core_ss on grid")
     grid_T_housing: List[List[float]] = Field(..., description="T_housing_ss on grid")
+
+
+# ---------------------------------------------------------------------------
+# File condition summary (per-file test condition metadata)
+# ---------------------------------------------------------------------------
+class FileConditionSummary(BaseModel):
+    """Summary of test conditions extracted from a data file."""
+
+    file_id: str = Field(..., description="File UUID")
+    filename: str = Field(..., description="Original filename")
+    rows: int = Field(..., description="Total data rows")
+    I_range: Tuple[Optional[float], Optional[float]] = Field(
+        ..., description="(min, max) phase current [A]"
+    )
+    rpm_range: Tuple[Optional[float], Optional[float]] = Field(
+        ..., description="(min, max) rotor speed [RPM]"
+    )
+    T_amb_mean: Optional[float] = Field(None, description="Mean ambient temperature [degC]")
+    T_coil_range: Tuple[Optional[float], Optional[float]] = Field(
+        ..., description="(min, max) coil temperature [degC]"
+    )
+    duration_s: Optional[float] = Field(None, description="Time span if time column exists [s]")
 
 
 # ---------------------------------------------------------------------------

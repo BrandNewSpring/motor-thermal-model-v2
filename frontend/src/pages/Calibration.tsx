@@ -3,7 +3,7 @@ import { useAppStore } from "@/stores/appStore";
 import { profilesApi, calibrationApi, filesApi } from "@/lib/api";
 import type { MotorProfile, MotorGeometry, MaterialProps } from "@/types/motor";
 import type { CalibSettings as CalibSettingsType, CalibProgressEvent } from "@/types/calibration";
-import type { FileUploadResponse } from "@/types/data";
+import type { FileUploadResponse, FileConditionSummary, ColumnMappingRequest } from "@/types/data";
 import DataUpload from "@/components/calibration/DataUpload";
 import CalibSettingsForm from "@/components/calibration/CalibSettings";
 import CalibProgress from "@/components/calibration/CalibProgress";
@@ -49,10 +49,13 @@ export default function Calibration() {
   const {
     currentProfileId,
     testFileId,
+    testFileIds,
     calibJobId,
     calibStatus,
     calibResult,
     setTestFile,
+    setTestFiles,
+    removeTestFile,
     setCurrentProfile,
     startCalib,
     updateProgress,
@@ -80,6 +83,12 @@ export default function Calibration() {
   const [uploadPreview, setUploadPreview] = useState<Record<string, unknown>[]>([]);
   const [lossMapFileId, setLossMapFileId] = useState<string | null>(null);
 
+  // Multi-file state
+  const [uploadedFiles, setUploadedFiles] = useState<FileUploadResponse[]>([]);
+  const [fileConditions, setFileConditions] = useState<Map<string, FileConditionSummary>>(
+    new Map(),
+  );
+
   // Simple iron loss params
   const [I_max, setIMax] = useState(10);
   const [RPM_max, setRPMMax] = useState(5000);
@@ -90,7 +99,6 @@ export default function Calibration() {
     void (async () => {
       try {
         const list = await profilesApi.list();
-        // list is MotorProfileSummary[], fetch full profiles
         const full = await Promise.all(list.map((p) => profilesApi.get(p.id)));
         setProfiles(full);
       } catch {
@@ -124,18 +132,103 @@ export default function Calibration() {
 
   const handleFileUploaded = useCallback(
     (fileId: string, response: FileUploadResponse) => {
+      // Set single-file reference for backwards compatibility
       setTestFile(fileId);
+
+      // Add to multi-file list
+      setUploadedFiles((prev) => {
+        if (prev.some((f) => f.file_id === fileId)) return prev;
+        return [...prev, response];
+      });
+
       setUploadColumns(response.columns);
       setUploadPreview(response.preview);
-      // Auto-map columns by name match
+
+      // Update file IDs array in store
+      setTestFiles(
+        [...uploadedFiles.map((f) => f.file_id), fileId].filter(
+          (id, idx, arr) => arr.indexOf(id) === idx,
+        ),
+      );
+
+      // Auto-map columns — supports both simple names and power analyzer
+      // formats like "I SigA[A]", "TS.Spd[/min]", "Cham.ComTemp[°C]"
       const mapping: Record<string, string> = {};
-      const targets = ["time", "rpm", "I_phase", "T_amb", "T_coil", "torque"];
-      for (const col of response.columns) {
-        const lower = col.toLowerCase().replace(/[\s_-]/g, "");
-        for (const target of targets) {
-          if (lower.includes(target.toLowerCase())) {
-            mapping[target] = col;
+      const cols = response.columns;
+      const lc = cols.map((c) => c.toLowerCase());
+
+      // time: look for "time" + "sec" or plain "time"
+      {
+        const idx = lc.findIndex((c) => c.includes("time") && c.includes("sec"));
+        if (idx >= 0) mapping.time = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => c === "time");
+          if (i2 >= 0) mapping.time = cols[i2];
+        }
+      }
+
+      // rpm: look for "spd" + "/min" or "rpm"
+      {
+        const idx = lc.findIndex((c) => c.includes("spd") && c.includes("/min"));
+        if (idx >= 0) mapping.rpm = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => c.includes("rpm"));
+          if (i2 >= 0) mapping.rpm = cols[i2];
+        }
+      }
+
+      // I_phase: prefer "i sig" + "[a]" (total RMS), then "i1" + "[a]", then "i_phase"
+      {
+        const idx = lc.findIndex((c) => c.includes("i sig") && c.includes("[a]"));
+        if (idx >= 0) mapping.I_phase = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => /^i\d+\[a\]/.test(c));
+          if (i2 >= 0) mapping.I_phase = cols[i2];
+          else {
+            const i3 = lc.findIndex((c) => c.includes("i_phase") || c.includes("iphase"));
+            if (i3 >= 0) mapping.I_phase = cols[i3];
           }
+        }
+      }
+
+      // T_amb: prefer "cham" or "amb" or "comtemp", then plain "t_amb"
+      {
+        const idx = lc.findIndex(
+          (c) => c.includes("cham") || c.includes("amb") || c.includes("comtemp"),
+        );
+        if (idx >= 0) mapping.T_amb = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => c.includes("t_amb") || c.includes("tamb"));
+          if (i2 >= 0) mapping.T_amb = cols[i2];
+        }
+      }
+
+      // T_coil: prefer "temp1[" (first thermocouple = likely coil), then "load.temp",
+      // then any "temp" + digit, then plain "t_coil"
+      {
+        const idx = lc.findIndex((c) => /^temp1\[/.test(c));
+        if (idx >= 0) mapping.T_coil = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => c.includes("load") && c.includes("temp"));
+          if (i2 >= 0) mapping.T_coil = cols[i2];
+          else {
+            const i3 = lc.findIndex((c) => /^temp\d+\[/.test(c));
+            if (i3 >= 0) mapping.T_coil = cols[i3];
+            else {
+              const i4 = lc.findIndex((c) => c.includes("t_coil") || c.includes("tcoil"));
+              if (i4 >= 0) mapping.T_coil = cols[i4];
+            }
+          }
+        }
+      }
+
+      // torque: prefer "trq" + "[n", then plain "torque"
+      {
+        const idx = lc.findIndex((c) => c.includes("trq") && c.includes("[n"));
+        if (idx >= 0) mapping.torque = cols[idx];
+        else {
+          const i2 = lc.findIndex((c) => c.includes("torque"));
+          if (i2 >= 0) mapping.torque = cols[i2];
         }
       }
       setColumnMapping((prev) => ({
@@ -145,8 +238,42 @@ export default function Calibration() {
         T_amb: mapping.T_amb || prev.T_amb,
         T_coil: mapping.T_coil || prev.T_coil,
       }));
+
+      // Fetch conditions for the uploaded file
+      void (async () => {
+        try {
+          const mappingRequest: ColumnMappingRequest = {
+            time: mapping.time || null,
+            rpm: mapping.rpm || null,
+            I_phase: mapping.I_phase || "",
+            T_amb: mapping.T_amb || "",
+            T_coil: mapping.T_coil || "",
+            torque: mapping.torque || null,
+          };
+          // Only fetch conditions if we have the required column mappings
+          if (mappingRequest.I_phase && mappingRequest.T_amb && mappingRequest.T_coil) {
+            const cond = await filesApi.getConditions(fileId, mappingRequest);
+            setFileConditions((prev) => new Map(prev).set(fileId, cond));
+          }
+        } catch {
+          // Conditions are optional — silently continue
+        }
+      })();
     },
-    [setTestFile],
+    [setTestFile, setTestFiles, uploadedFiles],
+  );
+
+  const handleRemoveFile = useCallback(
+    (fileId: string) => {
+      removeTestFile(fileId);
+      setUploadedFiles((prev) => prev.filter((f) => f.file_id !== fileId));
+      setFileConditions((prev) => {
+        const next = new Map(prev);
+        next.delete(fileId);
+        return next;
+      });
+    },
+    [removeTestFile],
   );
 
   async function handleStartCalibration() {
@@ -176,25 +303,38 @@ export default function Calibration() {
       }
     }
 
-    if (!testFileId || !profileId) return;
+    const fileIds = testFileIds.length > 0 ? testFileIds : testFileId ? [testFileId] : [];
+    if (fileIds.length === 0 || !profileId) return;
 
     try {
-      // Map columns first
+      // Map columns for each file
       if (columnMapping.I_phase && columnMapping.T_amb && columnMapping.T_coil) {
-        await filesApi.mapColumns(testFileId, {
+        const mappingRequest: ColumnMappingRequest = {
           time: columnMapping.time || null,
           rpm: columnMapping.rpm || null,
           I_phase: columnMapping.I_phase,
           T_amb: columnMapping.T_amb,
           T_coil: columnMapping.T_coil,
           torque: columnMapping.torque || null,
-        });
+        };
+        await Promise.all(fileIds.map((fid) => filesApi.mapColumns(fid, mappingRequest)));
       }
 
       const jobId = await calibrationApi.start({
         profile_id: profileId,
-        data_file_id: testFileId,
+        data_file_ids: fileIds,
         loss_map_file_id: lossMode === "map" ? lossMapFileId : null,
+        column_mapping:
+          columnMapping.I_phase && columnMapping.T_amb && columnMapping.T_coil
+            ? {
+                time: columnMapping.time || null,
+                rpm: columnMapping.rpm || null,
+                I_phase: columnMapping.I_phase,
+                T_amb: columnMapping.T_amb,
+                T_coil: columnMapping.T_coil,
+                torque: columnMapping.torque || null,
+              }
+            : null,
         settings,
       });
 
@@ -245,6 +385,10 @@ export default function Calibration() {
     );
   }
 
+  // Determine which file ID to pass to single-file components
+  const activeFileId = testFileIds.length > 0 ? testFileIds[0] : testFileId;
+  const hasFiles = testFileIds.length > 0 || testFileId !== null;
+
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
       <h1 className="text-lg font-semibold">Calibration</h1>
@@ -279,10 +423,14 @@ export default function Calibration() {
             <h2 className="text-sm font-semibold">Step 1: Upload Test Data</h2>
             <DataUpload
               fileType="test_data"
-              fileId={testFileId}
+              fileId={activeFileId}
               onFileUploaded={handleFileUploaded}
               columns={uploadColumns}
               preview={uploadPreview}
+              multiple
+              uploadedFiles={uploadedFiles}
+              fileConditions={fileConditions}
+              onRemoveFile={handleRemoveFile}
             />
           </div>
         )}
@@ -436,12 +584,31 @@ export default function Calibration() {
               columns={uploadColumns}
               columnMapping={columnMapping}
               onColumnMappingChange={setColumnMapping}
-              fileId={testFileId}
+              fileId={activeFileId}
             />
+
+            {/* Per-file summary for multi-file */}
+            {uploadedFiles.length > 1 && (
+              <div className="space-y-2">
+                <p className="text-xs font-semibold text-muted-foreground">
+                  Files to calibrate ({uploadedFiles.length})
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {uploadedFiles.map((f) => (
+                    <span
+                      key={f.file_id}
+                      className="rounded bg-muted px-2 py-0.5 text-xs font-mono"
+                    >
+                      {f.filename}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <Button
               onClick={() => void handleStartCalibration()}
-              disabled={!testFileId}
+              disabled={!hasFiles}
             >
               Start Calibration
             </Button>

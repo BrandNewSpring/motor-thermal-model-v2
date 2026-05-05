@@ -4,6 +4,7 @@ import Layout from "./app/layout";
 import Calibration from "./pages/Calibration";
 import Prediction from "./pages/Prediction";
 import Profiles from "./pages/Profiles";
+import Compressor from "./pages/Compressor";
 
 function AppContent() {
   return (
@@ -12,6 +13,7 @@ function AppContent() {
         <Route path="/" element={<Calibration />} />
         <Route path="/prediction" element={<Prediction />} />
         <Route path="/profiles" element={<Profiles />} />
+        <Route path="/compressor" element={<Compressor />} />
       </Route>
     </Routes>
   );

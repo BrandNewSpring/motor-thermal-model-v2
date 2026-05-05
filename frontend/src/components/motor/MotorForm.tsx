@@ -55,15 +55,27 @@ export default function MotorForm({
   }, [computePreview]);
 
   function handleGeoChange(key: keyof MotorGeometry, value: string) {
-    const num = value === "" && key === "L_housing_mm" ? null : parseFloat(value);
-    onGeometryChange({
-      ...geometry,
-      [key]: key === "L_housing_mm" ? (num as number | null) : (num as number),
-    });
+    if (key === "L_housing_mm") {
+      // L_housing_mm is the only nullable geometry field
+      const num = value === "" ? null : parseFloat(value);
+      onGeometryChange({ ...geometry, [key]: num as number | null });
+      return;
+    }
+    const num = parseFloat(value);
+    // Guard: keep previous valid value if input is empty or NaN
+    if (value === "" || Number.isNaN(num)) {
+      return;
+    }
+    onGeometryChange({ ...geometry, [key]: num });
   }
 
   function handleMatChange(key: keyof MaterialProps, value: string) {
-    onMaterialChange({ ...material, [key]: parseFloat(value) });
+    const num = parseFloat(value);
+    // Guard: keep previous valid value if input is empty or NaN
+    if (value === "" || Number.isNaN(num)) {
+      return;
+    }
+    onMaterialChange({ ...material, [key]: num });
   }
 
   return (

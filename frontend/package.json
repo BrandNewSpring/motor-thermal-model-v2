@@ -20,6 +20,7 @@
     "clsx": "^2.1.1",
     "lucide-react": "^1.11.0",
     "plotly.js": "^3.5.0",
+    "plotly.js-dist-min": "^3.5.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-hook-form": "^7.74.0",

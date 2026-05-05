@@ -5,7 +5,7 @@ import type { CalibResult, CalibProgressEvent } from "@/types/calibration";
 // UI Slice
 // ---------------------------------------------------------------------------
 interface UiSlice {
-  activePage: "calibration" | "prediction" | "profiles";
+  activePage: "calibration" | "prediction" | "compressor" | "profiles";
   sidebarCollapsed: boolean;
   setActivePage: (page: UiSlice["activePage"]) => void;
   toggleSidebar: () => void;
@@ -26,6 +26,7 @@ type CalibStatus = "idle" | "running" | "done" | "error";
 
 interface CalibrationSlice {
   testFileId: string | null;
+  testFileIds: string[];
   lossMapFileId: string | null;
   columnMapping: Record<string, string>;
   calibJobId: string | null;
@@ -35,6 +36,8 @@ interface CalibrationSlice {
   calibError: string | null;
 
   setTestFile: (id: string | null) => void;
+  setTestFiles: (ids: string[]) => void;
+  removeTestFile: (id: string) => void;
   setLossMapFile: (id: string | null) => void;
   setColumnMapping: (mapping: Record<string, string>) => void;
   startCalib: (jobId: string) => void;
@@ -59,6 +62,7 @@ const initialState = {
 
   // Calibration
   testFileId: null as string | null,
+  testFileIds: [] as string[],
   lossMapFileId: null as string | null,
   columnMapping: {} as Record<string, string>,
   calibJobId: null as string | null,
@@ -80,6 +84,9 @@ export const useAppStore = create<AppStore>()((set) => ({
 
   // Calibration actions
   setTestFile: (id) => set({ testFileId: id }),
+  setTestFiles: (ids) => set({ testFileIds: ids }),
+  removeTestFile: (id) =>
+    set((s) => ({ testFileIds: s.testFileIds.filter((fid) => fid !== id) })),
   setLossMapFile: (id) => set({ lossMapFileId: id }),
   setColumnMapping: (mapping) => set({ columnMapping: mapping }),
 
@@ -117,6 +124,7 @@ export const useAppStore = create<AppStore>()((set) => ({
       calibResult: null,
       calibError: null,
       testFileId: null,
+      testFileIds: [],
       lossMapFileId: null,
       columnMapping: {},
     }),

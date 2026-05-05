@@ -15,8 +15,9 @@ export interface CalibSettings {
 
 export interface CalibRequest {
   profile_id: string;
-  data_file_id: string;
+  data_file_ids: string[];
   loss_map_file_id?: string | null;
+  column_mapping?: ColumnMapping | null;
   settings: CalibSettings;
 }
 
@@ -40,6 +41,23 @@ export interface ThermalParams {
   R2_mold: number | null;
 }
 
+export interface FileConditions {
+  I_mean: number | null;
+  T_amb_mean: number | null;
+  rpm_representative: number | null;
+}
+
+export interface FileCalibResult {
+  file_id: string;
+  filename: string;
+  conditions: FileConditions;
+  time_array: number[];
+  T_coil_meas: number[];
+  T_coil_sim: number[];
+  T_core_sim: number[];
+  T_housing_sim: number[];
+}
+
 export interface CalibResult {
   params: ThermalParams;
   rmse: number;
@@ -47,10 +65,13 @@ export interface CalibResult {
   T_coil_sim: number[];
   T_core_sim: number[];
   T_housing_sim: number[];
+  T_coil_meas: number[];
+  time_array: number[];
   residuals: number[];
   time_s: number;
   converged: boolean;
   loss_history: number[];
+  per_file_results: FileCalibResult[];
 }
 
 // SSE progress event types

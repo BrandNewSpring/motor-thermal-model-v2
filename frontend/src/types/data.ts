@@ -67,6 +67,17 @@ export interface GridPredictionResult {
   grid_T_housing: number[][];
 }
 
+export interface FileConditionSummary {
+  file_id: string;
+  filename: string;
+  rows: number;
+  I_range: [number | null, number | null];
+  rpm_range: [number | null, number | null];
+  T_amb_mean: number | null;
+  T_coil_range: [number | null, number | null];
+  duration_s: number | null;
+}
+
 export interface ExportRequest {
   profile_id: string;
   job_id?: string | null;

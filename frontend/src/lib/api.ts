@@ -19,16 +19,30 @@ import type {
   FileColumnsResponse,
   ColumnMappingRequest,
   ColumnMappingResponse,
+  FileConditionSummary,
   SteadyStateRequest,
   SteadyStateResult,
   GridPredictionRequest,
   GridPredictionResult,
   ExportRequest,
 } from "@/types/data";
+import type {
+  CompressorUploadResponse,
+  CompressorDatasetsResponse,
+  CompressorPredictRequest,
+  CompressorPredictResponse,
+  CompressorCalibrateRequest,
+  CompressorCalibProgressEvent,
+  CompressorEnergyRequest,
+  CompressorEnergyResponse,
+  EnergyCalibRequest,
+  EnergyCalibResult,
+} from "@/types/compressor";
 
+// @MX:WARN: Do NOT set default Content-Type here — axios auto-detects based on body type
+// @MX:REASON: Setting application/json causes axios 1.x to serialize FormData as JSON, breaking file uploads (422)
 const api = axios.create({
   baseURL: "/api",
-  headers: { "Content-Type": "application/json" },
 });
 
 // Helper to extract data from axios response
@@ -91,7 +105,31 @@ export const filesApi = {
     const response = await api.post<FileUploadResponse>(
       "/files/upload",
       form,
-      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return response.data;
+  },
+
+  uploadBatch: async (
+    files: File[],
+    type: "test_data" | "loss_map",
+  ): Promise<FileUploadResponse[]> => {
+    const form = new FormData();
+    files.forEach((f) => form.append("files", f));
+    form.append("type", type);
+    const response = await api.post<FileUploadResponse[]>(
+      "/files/upload-batch",
+      form,
+    );
+    return response.data;
+  },
+
+  getConditions: async (
+    fileId: string,
+    mapping: ColumnMappingRequest,
+  ): Promise<FileConditionSummary> => {
+    const response = await api.post<FileConditionSummary>(
+      `/files/${fileId}/conditions`,
+      mapping,
     );
     return response.data;
   },
@@ -107,7 +145,7 @@ export const filesApi = {
       .then((r) => r.data),
 
   delete: (fileId: string) =>
-    api.delete(`/files/${fileId}`).then((r) => r.status === 204),
+    api.delete(`/files/${fileId}`).then((r) => r.status === 200),
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +236,111 @@ export const exportApi = {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Compressor API
+// ---------------------------------------------------------------------------
+export const compressorApi = {
+  upload: async (file: File): Promise<CompressorUploadResponse> => {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await api.post<CompressorUploadResponse>(
+      "/compressor/upload",
+      form,
+    );
+    return response.data;
+  },
+
+  getDatasets: () =>
+    api
+      .get<CompressorDatasetsResponse>("/compressor/datasets")
+      .then((r) => r.data),
+
+  predict: (req: CompressorPredictRequest) =>
+    api
+      .post<CompressorPredictResponse>("/compressor/predict", req)
+      .then((r) => r.data),
+
+  predictEnergy: async (req: CompressorEnergyRequest): Promise<CompressorEnergyResponse> => {
+    const res = await api.post<CompressorEnergyResponse>("/compressor/predict-energy", req);
+    return unwrap(res);
+  },
+
+  calibrateEnergy: async (req: EnergyCalibRequest): Promise<EnergyCalibResult> => {
+    const res = await api.post<EnergyCalibResult>("/compressor/calibrate-energy", req);
+    return unwrap(res);
+  },
+
+  /**
+   * Opens an SSE connection for compressor calibration progress events.
+   * Returns a cleanup function to close the connection.
+   */
+  streamCalibration: (
+    req: CompressorCalibrateRequest,
+    onEvent: (event: CompressorCalibProgressEvent) => void,
+    onError: (error: Event) => void,
+  ): (() => void) => {
+    // Compressor calibration uses POST-based SSE via fetch + ReadableStream
+    // since EventSource only supports GET.
+    const controller = new AbortController();
+    let closed = false;
+
+    void (async () => {
+      try {
+        const response = await fetch("/api/compressor/calibrate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(req),
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          onError(new Event(`HTTP ${response.status}`));
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (!closed) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            try {
+              const parsed: CompressorCalibProgressEvent = JSON.parse(
+                trimmed.slice(6),
+              );
+              onEvent(parsed);
+              if (parsed.type === "done" || parsed.type === "error") {
+                closed = true;
+                break;
+              }
+            } catch {
+              // Ignore malformed SSE data
+            }
+          }
+        }
+      } catch (err: unknown) {
+        if (!closed) {
+          onError(new Event(err instanceof Error ? err.message : "SSE error"));
+        }
+      }
+    })();
+
+    return () => {
+      closed = true;
+      controller.abort();
+    };
   },
 };
 

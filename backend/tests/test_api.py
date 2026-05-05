@@ -262,6 +262,13 @@ class TestFileUpload:
         assert "time" in result["columns"]
         assert len(result["preview"]) == 3
 
+    def test_file_upload_json_body_rejected(self):
+        resp = client.post(
+            "/api/files/upload",
+            json={"type": "test_data"},
+        )
+        assert resp.status_code == 422
+
     def test_file_upload_unsupported(self):
         resp = client.post(
             "/api/files/upload",
@@ -436,3 +443,199 @@ class TestExport:
         body = {"profile_id": "nonexistent"}
         resp = client.post("/api/export/excel", json=body)
         assert resp.status_code == 404
+
+
+class TestFileUploadBatch:
+    def test_upload_batch_multiple_files(self):
+        csv1 = b"time,rpm,I_phase,T_amb,T_coil\n0,1000,5.0,25.0,30.0\n1,1500,6.0,25.0,35.0"
+        csv2 = b"time,rpm,I_phase,T_amb,T_coil\n0,2000,4.0,26.0,28.0\n1,2500,5.5,26.0,33.0\n2,3000,7.0,26.0,40.0"
+
+        resp = client.post(
+            "/api/files/upload-batch",
+            files=[
+                ("files", ("data1.csv", io.BytesIO(csv1), "text/csv")),
+                ("files", ("data2.csv", io.BytesIO(csv2), "text/csv")),
+            ],
+            data={"type": "test_data"},
+        )
+        assert resp.status_code == 200
+        results = resp.json()
+        assert len(results) == 2
+        assert results[0]["filename"] == "data1.csv"
+        assert results[0]["rows"] == 2
+        assert results[1]["filename"] == "data2.csv"
+        assert results[1]["rows"] == 3
+        assert results[0]["file_id"] != results[1]["file_id"]
+
+    def test_upload_batch_invalid_type(self):
+        csv_content = b"a,b\n1,2"
+        resp = client.post(
+            "/api/files/upload-batch",
+            files=[
+                ("files", ("data.csv", io.BytesIO(csv_content), "text/csv")),
+            ],
+            data={"type": "invalid_type"},
+        )
+        assert resp.status_code == 400
+
+    def test_upload_batch_unsupported_file(self):
+        resp = client.post(
+            "/api/files/upload-batch",
+            files=[
+                ("files", ("data.txt", io.BytesIO(b"hello"), "text/plain")),
+            ],
+            data={"type": "test_data"},
+        )
+        assert resp.status_code == 400
+
+
+class TestFileConditions:
+    def test_extract_conditions(self):
+        csv_content = (
+            b"time,rpm,I_phase,T_amb,T_coil\n"
+            b"0,1000,5.0,25.0,30.0\n"
+            b"10,1500,6.0,25.5,35.0\n"
+            b"20,2000,7.0,26.0,40.0"
+        )
+        upload_resp = client.post(
+            "/api/files/upload",
+            files={"file": ("data.csv", io.BytesIO(csv_content), "text/csv")},
+            data={"type": "test_data"},
+        )
+        file_id = upload_resp.json()["file_id"]
+
+        mapping = {
+            "time": "time",
+            "rpm": "rpm",
+            "I_phase": "I_phase",
+            "T_amb": "T_amb",
+            "T_coil": "T_coil",
+        }
+        resp = client.post(f"/api/files/{file_id}/conditions", json=mapping)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["file_id"] == file_id
+        assert data["filename"] == "data.csv"
+        assert data["rows"] == 3
+        assert data["I_range"] == [5.0, 7.0]
+        assert data["rpm_range"] == [1000.0, 2000.0]
+        assert data["T_amb_mean"] is not None
+        assert abs(data["T_amb_mean"] - 25.5) < 0.01
+        assert data["T_coil_range"] == [30.0, 40.0]
+        assert data["duration_s"] == 20.0
+
+    def test_extract_conditions_missing_column(self):
+        csv_content = b"time,rpm,I_phase,T_amb,T_coil\n0,1000,5.0,25.0,30.0"
+        upload_resp = client.post(
+            "/api/files/upload",
+            files={"file": ("data.csv", io.BytesIO(csv_content), "text/csv")},
+            data={"type": "test_data"},
+        )
+        file_id = upload_resp.json()["file_id"]
+
+        mapping = {
+            "I_phase": "nonexistent_column",
+            "T_amb": "T_amb",
+            "T_coil": "T_coil",
+        }
+        resp = client.post(f"/api/files/{file_id}/conditions", json=mapping)
+        assert resp.status_code == 422
+
+    def test_extract_conditions_file_not_found(self):
+        mapping = {
+            "I_phase": "I_phase",
+            "T_amb": "T_amb",
+            "T_coil": "T_coil",
+        }
+        resp = client.post("/api/files/nonexistent-id/conditions", json=mapping)
+        assert resp.status_code == 404
+
+
+class TestCalibrationMultiFile:
+    def test_calibration_multi_file_ids(self, sample_profile_data: dict):
+        # Create profile
+        profile_resp = client.post("/api/profiles", json=sample_profile_data)
+        profile_id = profile_resp.json()["id"]
+
+        # Upload two synthetic CSV files
+        N = 50
+        t = np.linspace(0, 1000, N)
+        I = np.full(N, 3.0)
+        rpm = np.full(N, 3000.0)
+        T_amb = np.full(N, 25.0)
+        T_coil = 25.0 + (55.0 - 25.0) * (t / t[-1])
+
+        file_ids = []
+        for label in ["file1", "file2"]:
+            lines = ["time,rpm,I_phase,T_amb,T_coil"]
+            for i in range(N):
+                lines.append(f"{t[i]:.2f},{rpm[i]:.0f},{I[i]:.1f},{T_amb[i]:.1f},{T_coil[i]:.2f}")
+            csv_bytes = "\n".join(lines).encode("utf-8")
+
+            upload_resp = client.post(
+                "/api/files/upload",
+                files={"file": (f"{label}.csv", io.BytesIO(csv_bytes), "text/csv")},
+                data={"type": "test_data"},
+            )
+            assert upload_resp.status_code == 200
+            file_ids.append(upload_resp.json()["file_id"])
+
+        # Start calibration with data_file_ids
+        calib_body = {
+            "profile_id": profile_id,
+            "data_file_ids": file_ids,
+            "settings": {
+                "n_starts": 1,
+                "tail_gamma": 2.0,
+                "ss_penalty": 5.0,
+            },
+        }
+        resp = client.post("/api/calibration/start", json=calib_body)
+        assert resp.status_code == 200
+        result = resp.json()
+        assert "job_id" in result
+
+    def test_calibration_legacy_single_file_id(self, sample_profile_data: dict):
+        """Backward compatibility: single data_file_id still works."""
+        profile_resp = client.post("/api/profiles", json=sample_profile_data)
+        profile_id = profile_resp.json()["id"]
+
+        N = 50
+        t = np.linspace(0, 1000, N)
+        I = np.full(N, 3.0)
+        rpm = np.full(N, 3000.0)
+        T_amb = np.full(N, 25.0)
+        T_coil = 25.0 + (55.0 - 25.0) * (t / t[-1])
+
+        lines = ["time,rpm,I_phase,T_amb,T_coil"]
+        for i in range(N):
+            lines.append(f"{t[i]:.2f},{rpm[i]:.0f},{I[i]:.1f},{T_amb[i]:.1f},{T_coil[i]:.2f}")
+        csv_bytes = "\n".join(lines).encode("utf-8")
+
+        upload_resp = client.post(
+            "/api/files/upload",
+            files={"file": ("synthetic.csv", io.BytesIO(csv_bytes), "text/csv")},
+            data={"type": "test_data"},
+        )
+        file_id = upload_resp.json()["file_id"]
+
+        calib_body = {
+            "profile_id": profile_id,
+            "data_file_id": file_id,
+            "settings": {"n_starts": 1},
+        }
+        resp = client.post("/api/calibration/start", json=calib_body)
+        assert resp.status_code == 200
+        assert "job_id" in resp.json()
+
+    def test_calibration_no_file_id_error(self, sample_profile_data: dict):
+        """Must reject request with neither data_file_id nor data_file_ids."""
+        profile_resp = client.post("/api/profiles", json=sample_profile_data)
+        profile_id = profile_resp.json()["id"]
+
+        calib_body = {
+            "profile_id": profile_id,
+            "settings": {"n_starts": 1},
+        }
+        resp = client.post("/api/calibration/start", json=calib_body)
+        assert resp.status_code == 422
